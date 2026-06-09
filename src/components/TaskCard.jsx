@@ -16,9 +16,10 @@ export default function TaskCard({
   punishment,
   onPunishmentDone,
 }) {
-  if (!task) return null;
   const fromName = fromPlayer?.name || fromPlayer?.first_name || '?';
   const toName = toPlayer?.name || toPlayer?.first_name || '?';
+
+  if (!task && !punishment) return null;
 
   if (punishment) {
     return (
@@ -33,6 +34,8 @@ export default function TaskCard({
       </div>
     );
   }
+
+  if (!task) return null;
 
   return (
     <div className={`task-card task-card-anim ${task.level}`}>
