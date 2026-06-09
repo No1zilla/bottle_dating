@@ -26,6 +26,7 @@ export default function App() {
   const [story, setStory] = useState('game');
   const [activePanel, setActivePanel] = useState('home');
   const [players, setPlayers] = useState([]);
+  const [gameMode, setGameMode] = useState('dating');
   const [scheme, setScheme] = useState('space_gray');
   const { user } = useVKUser();
 
@@ -118,12 +119,15 @@ export default function App() {
                 setPlayers={setPlayers}
                 currentUser={user}
                 onStart={goToGame}
+                gameMode={gameMode}
+                setGameMode={setGameMode}
               />
               <Game
                 id="gameplay"
                 players={players}
                 setPlayers={setPlayers}
                 onEndGame={endGame}
+                gameMode={gameMode}
               />
               <Results id="results" players={players} onPlayAgain={playAgain} />
             </View>

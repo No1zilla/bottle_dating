@@ -2,66 +2,77 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Panel } from '@vkontakte/vkui';
 import BottleSpinner from '../components/BottleSpinner.jsx';
 import TaskCard from '../components/TaskCard.jsx';
-import { getRandomTask } from '../data/tasks.js';
+import { getRandomTask, getRandomPunishment } from '../data/tasks.js';
 import { addScore, bumpStats } from '../hooks/useStorage.js';
 import { showBanner, hideBanner, showRewardedAd, getAdCooldownMs } from '../hooks/useAds.js';
 import { useSessionState } from '../hooks/useSessionState.js';
 
-export default function Game({ id, players, setPlayers, onEndGame }) {
+const CUSTOM_TASK_MAX = 100;
+
+export default function Game({ id, players, setPlayers, onEndGame, gameMode = 'dating' }) {
   const [spinnerIndex, setSpinnerIndex] = useSessionState('bottle_game_spinnerIndex', 0);
   const [targetIndex, setTargetIndex] = useSessionState('bottle_game_targetIndex', null);
   const [task, setTask] = useSessionState('bottle_game_task', null);
-  const [phase, setPhase] = useSessionState('bottle_game_phase', 'ready'); // ready | spinning | task | between
+  // phases: ready | spinning | task | punishment | between
+  const [phase, setPhase] = useSessionState('bottle_game_phase', 'ready');
+  const [punishment, setPunishment] = useSessionState('bottle_game_punishment', null);
   const [isSpinning, setIsSpinning] = useState(false);
   const [adLoading, setAdLoading] = useState(false);
   const [cooldownLeft, setCooldownLeft] = useState(() => getAdCooldownMs());
   const [confirmEndOpen, setConfirmEndOpen] = useState(false);
+
+  // Custom tasks
+  const [customTasks, setCustomTasks] = useSessionState('bottle_game_customTasks', []);
+  const [customTaskModal, setCustomTaskModal] = useState(false);
+  const [customTaskText, setCustomTaskText] = useState('');
+  const [customTaskError, setCustomTaskError] = useState('');
+
   const roundResolvedRef = useRef(false);
 
-  // Tick down the ad cooldown timer while it's active
   useEffect(() => {
     if (cooldownLeft <= 0) return;
     const tick = () => setCooldownLeft(getAdCooldownMs());
     tick();
-    const id = setInterval(tick, 500);
-    return () => clearInterval(id);
+    const interval = setInterval(tick, 500);
+    return () => clearInterval(interval);
   }, [cooldownLeft > 0]);
 
-  // If we were in the middle of a spin animation when the user left,
-  // restore to the resulting task screen on mount.
   useEffect(() => {
     if (phase === 'spinning') {
       setPhase('task');
-      if (!task) setTask(getRandomTask());
+      if (!task) setTask(getRandomTaskForMode());
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     showBanner();
-    return () => {
-      hideBanner();
-    };
+    return () => { hideBanner(); };
   }, []);
 
-  // Lock body scroll while the end-game confirmation modal is open + ESC closes it
   useEffect(() => {
-    if (!confirmEndOpen) return;
+    if (!confirmEndOpen && !customTaskModal) return;
     document.body.classList.add('modal-open');
     const onKey = (e) => {
-      if (e.key === 'Escape') setConfirmEndOpen(false);
+      if (e.key === 'Escape') { setConfirmEndOpen(false); setCustomTaskModal(false); }
     };
     document.addEventListener('keydown', onKey);
     return () => {
       document.body.classList.remove('modal-open');
       document.removeEventListener('keydown', onKey);
     };
-  }, [confirmEndOpen]);
+  }, [confirmEndOpen, customTaskModal]);
+
+  function getRandomTaskForMode() {
+    // Mix in custom tasks with 25% probability if any exist
+    if (customTasks.length > 0 && Math.random() < 0.25) {
+      const ct = customTasks[Math.floor(Math.random() * customTasks.length)];
+      return ct;
+    }
+    return getRandomTask(gameMode);
+  }
 
   function startSpin() {
     if (players.length < 2) return;
-    // After the previous round the player who got the task (targetIndex) becomes
-    // the next spinner. The very first spin just uses the current spinnerIndex.
     let fromIndex = spinnerIndex;
     if (phase === 'between' && targetIndex != null) {
       fromIndex = targetIndex;
@@ -73,6 +84,7 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
     }
     setTargetIndex(t);
     setTask(null);
+    setPunishment(null);
     roundResolvedRef.current = false;
     setPhase('spinning');
     setIsSpinning(true);
@@ -80,71 +92,95 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
 
   const handleSpinComplete = useCallback(() => {
     setIsSpinning(false);
-    setTask(getRandomTask());
+    setTask(getRandomTaskForMode());
     setPhase('task');
-  }, []);
+  }, [customTasks, gameMode]);
 
   async function handleComplete() {
     if (!task || roundResolvedRef.current) return;
     roundResolvedRef.current = true;
-    const earned = task.points;
-    // Points go to the player the bottle pointed at (who performed the task).
+    const earned = task.points || 20;
     const playerId = players[targetIndex]?.id;
     setPlayers((ps) =>
       ps.map((p) => (p.id === playerId ? { ...p, score: (p.score || 0) + earned } : p))
     );
     setPhase('between');
     setTask(null);
-    // keep targetIndex around — startSpin uses it to pick the next spinner
-    try {
-      await addScore(earned);
-      await bumpStats({ tasks: 1 });
-    } catch {}
+    try { await addScore(earned); await bumpStats({ tasks: 1 }); } catch {}
+  }
+
+  async function handleFail() {
+    if (!task || roundResolvedRef.current) return;
+    // Show punishment card first, then ad after punishment is dismissed
+    const p = getRandomPunishment();
+    setPunishment(p);
+    setPhase('punishment');
+    // Don't mark roundResolved yet — we resolve after punishment
+  }
+
+  async function handlePunishmentDone() {
+    if (roundResolvedRef.current) return;
+    roundResolvedRef.current = true;
+    setPhase('between');
+    setTask(null);
+    setPunishment(null);
+    try { await bumpStats({ tasks: 1 }); } catch {}
+
+    // Show rewarded ad after punishment, with cooldown guard
+    if (cooldownLeft <= 0) {
+      setAdLoading(true);
+      try {
+        await Promise.race([showRewardedAd(), new Promise((r) => setTimeout(r, 8000))]);
+      } catch {}
+      setAdLoading(false);
+      setCooldownLeft(getAdCooldownMs());
+    }
   }
 
   async function handleSkip() {
     if (roundResolvedRef.current || adLoading || cooldownLeft > 0) return;
     setAdLoading(true);
     try {
-      // Show rewarded ad before granting skip. If ads aren't available
-      // (running outside VK, slot not approved yet, etc.) — skip silently.
-      // Guard against the bridge never resolving (e.g. ad closed by user
-      // outside VK's standard flow) — fall through after 8 seconds.
-      await Promise.race([
-        showRewardedAd(),
-        new Promise((resolve) => setTimeout(resolve, 8000)),
-      ]);
-    } catch {
-      // swallow — we always want to release the UI
-    } finally {
-      setAdLoading(false);
-      setCooldownLeft(getAdCooldownMs());
-    }
+      await Promise.race([showRewardedAd(), new Promise((r) => setTimeout(r, 8000))]);
+    } catch {}
+    setAdLoading(false);
+    setCooldownLeft(getAdCooldownMs());
     if (roundResolvedRef.current) return;
     roundResolvedRef.current = true;
     setPhase('between');
     setTask(null);
-    // keep targetIndex so the next spinner is the player who got the task
   }
 
-  function requestEndGame() {
-    setConfirmEndOpen(true);
+  // Custom task management
+  function openCustomTaskModal() { setCustomTaskText(''); setCustomTaskError(''); setCustomTaskModal(true); }
+  function closeCustomTaskModal() { setCustomTaskModal(false); }
+  function addCustomTask() {
+    const trimmed = customTaskText.trim();
+    if (!trimmed) { setCustomTaskError('Задание не может быть пустым'); return; }
+    if (trimmed.length < 5) { setCustomTaskError('Слишком короткое задание'); return; }
+    const newTask = {
+      id: `custom_${Date.now()}`,
+      mode: gameMode,
+      level: 'medium',
+      points: 20,
+      text: trimmed,
+      isCustom: true,
+    };
+    setCustomTasks([...customTasks, newTask]);
+    closeCustomTaskModal();
   }
-  function cancelEndGame() {
-    setConfirmEndOpen(false);
-  }
+
+  function requestEndGame() { setConfirmEndOpen(true); }
+  function cancelEndGame() { setConfirmEndOpen(false); }
   function handleEndGame() {
     setConfirmEndOpen(false);
     bumpStats({ games: 1 }).catch(() => {});
     try {
-      sessionStorage.removeItem('bottle_game_spinnerIndex');
-      sessionStorage.removeItem('bottle_game_targetIndex');
-      sessionStorage.removeItem('bottle_game_task');
-      sessionStorage.removeItem('bottle_game_phase');
+      ['spinnerIndex', 'targetIndex', 'task', 'phase', 'punishment', 'customTasks'].forEach((k) =>
+        sessionStorage.removeItem(`bottle_game_${k}`)
+      );
     } catch {}
-    if (typeof onEndGame === 'function') {
-      onEndGame();
-    }
+    if (typeof onEndGame === 'function') onEndGame();
   }
 
   const spinner = players[spinnerIndex];
@@ -153,17 +189,20 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
   const spinnerName = spinner?.name || spinner?.first_name || '';
   const spinnerScore = spinner?.score || 0;
 
+  const MODE_LABELS = { dating: '💬 Знакомство', flirt: '😏 Флирт', fire: '🔥 Огонь' };
+
   return (
     <Panel id={id}>
       <div className="banner" style={{ marginTop: '1rem' }}>
-        <div>
-          <div className="banner-label">Сейчас крутит</div>
-          <div className="banner-value">
-            {spinnerName}{' '}
-            <span className="banner-score" style={{ fontSize: '1rem' }}>
-              · {spinnerScore} очков
-            </span>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+          <div>
+            <div className="banner-label">Сейчас крутит</div>
+            <div className="banner-value">
+              {spinnerName}{' '}
+              <span className="banner-score" style={{ fontSize: '1rem' }}>· {spinnerScore} очков</span>
+            </div>
           </div>
+          <span className="mode-chip">{MODE_LABELS[gameMode] || gameMode}</span>
         </div>
       </div>
 
@@ -177,9 +216,7 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
 
       {showSpinButton && (
         <div style={{ padding: '0 1rem' }}>
-          <button className="btn-gradient" onClick={startSpin}>
-            Крутить бутылку
-          </button>
+          <button className="btn-gradient" onClick={startSpin}>Крутить бутылку</button>
         </div>
       )}
 
@@ -187,21 +224,22 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
         <div className="empty-state">Бутылка крутится...</div>
       )}
 
-      {phase === 'task' && task && (
+      {(phase === 'task' || phase === 'punishment') && (
         <TaskCard
-          task={task}
+          task={phase === 'task' ? task : null}
           fromPlayer={spinner}
           toPlayer={target}
           onComplete={handleComplete}
+          onFail={handleFail}
           onSkip={handleSkip}
           skipLabel={
             cooldownLeft > 0
               ? `Пропуск через ${Math.ceil(cooldownLeft / 1000)} с`
-              : adLoading
-                ? 'Реклама…'
-                : 'Пропустить 📺'
+              : adLoading ? 'Реклама…' : 'Пропустить 📺'
           }
           skipDisabled={adLoading || cooldownLeft > 0}
+          punishment={phase === 'punishment' ? punishment : null}
+          onPunishmentDone={handlePunishmentDone}
         />
       )}
 
@@ -210,10 +248,7 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
         {players.map((p, i) => {
           const isCurrent = i === spinnerIndex;
           return (
-            <div
-              key={p.id}
-              className={`scoreboard-row${isCurrent ? ' current' : ''}`}
-            >
+            <div key={p.id} className={`scoreboard-row${isCurrent ? ' current' : ''}`}>
               <span className="scoreboard-name">{p.name || p.first_name}</span>
               <span className="scoreboard-score">{p.score || 0}</span>
             </div>
@@ -221,40 +256,84 @@ export default function Game({ id, players, setPlayers, onEndGame }) {
         })}
       </div>
 
-      <div style={{ padding: '1rem' }}>
-        <button className="btn-ghost" onClick={requestEndGame}>
-          Завершить игру
+      <div style={{ padding: '0 1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+        <button className="btn-ghost" onClick={openCustomTaskModal}>
+          + Своё задание {customTasks.length > 0 ? `(${customTasks.length})` : ''}
         </button>
+        <button className="btn-ghost" onClick={requestEndGame}>Завершить игру</button>
       </div>
-      {/* Spacer so the bottom VK banner ad doesn't overlap the last button */}
       <div style={{ height: 72 }} />
 
+      {/* Confirm end game modal */}
       {confirmEndOpen && (
         <div className="modal-overlay" onClick={cancelEndGame}>
           <div className="modal-box" onClick={(e) => e.stopPropagation()}>
-            <div
-              style={{
-                fontSize: '1.125rem',
-                fontWeight: 700,
-                marginBottom: '0.5rem',
-                color: '#fff',
-              }}
-            >
+            <div style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '0.5rem', color: '#fff' }}>
               Завершить игру?
             </div>
-            <div
-              className="text-secondary"
-              style={{ marginBottom: '1.25rem' }}
-            >
+            <div className="text-secondary" style={{ marginBottom: '1.25rem' }}>
               Прогресс текущей партии не сохранится. Появится итоговая таблица результатов.
             </div>
             <div className="btn-row">
-              <button className="btn-gradient" onClick={handleEndGame}>
-                Завершить
+              <button className="btn-gradient" onClick={handleEndGame}>Завершить</button>
+              <button className="btn-ghost" onClick={cancelEndGame}>Продолжить игру</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom task modal */}
+      {customTaskModal && (
+        <div className="modal-overlay" onClick={closeCustomTaskModal}>
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <div style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '0.5rem', color: '#fff' }}>
+              Своё задание
+            </div>
+            <div className="text-secondary" style={{ marginBottom: '0.75rem' }}>
+              Задание попадёт в общий пул с вероятностью ~25%
+            </div>
+            <div className="modal-label">
+              Текст задания
+              <span style={{ float: 'right', opacity: 0.6 }}>{customTaskText.length}/{CUSTOM_TASK_MAX}</span>
+            </div>
+            <textarea
+              className="modal-input"
+              value={customTaskText}
+              onChange={(e) => {
+                setCustomTaskText(e.target.value.slice(0, CUSTOM_TASK_MAX));
+                if (customTaskError) setCustomTaskError('');
+              }}
+              placeholder="Например: Изобрази кошку 20 секунд"
+              maxLength={CUSTOM_TASK_MAX}
+              rows={3}
+              autoFocus
+              style={{ resize: 'none', minHeight: 72 }}
+            />
+            {customTaskError && (
+              <div style={{ color: '#ff6b6b', fontSize: '0.8rem', marginTop: '-0.5rem', marginBottom: '0.875rem' }}>
+                {customTaskError}
+              </div>
+            )}
+            {customTasks.length > 0 && (
+              <div style={{ marginBottom: '0.75rem' }}>
+                <div className="modal-label" style={{ marginBottom: '0.5rem' }}>Добавленные задания</div>
+                {customTasks.map((ct) => (
+                  <div key={ct.id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.375rem' }}>
+                    <span style={{ flex: 1, fontSize: '0.875rem', color: 'var(--text-secondary)' }}>{ct.text}</span>
+                    <button
+                      style={{ background: 'none', border: 'none', color: '#ff6b6b', cursor: 'pointer', fontSize: '1.1rem', padding: '0 4px' }}
+                      onClick={() => setCustomTasks(customTasks.filter((t) => t.id !== ct.id))}
+                      aria-label="Удалить"
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="btn-row">
+              <button className="btn-gradient" onClick={addCustomTask} disabled={customTaskText.trim().length < 5}>
+                Добавить
               </button>
-              <button className="btn-ghost" onClick={cancelEndGame}>
-                Продолжить игру
-              </button>
+              <button className="btn-ghost" onClick={closeCustomTaskModal}>Закрыть</button>
             </div>
           </div>
         </div>
